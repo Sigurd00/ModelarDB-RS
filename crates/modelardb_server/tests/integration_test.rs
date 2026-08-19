@@ -40,7 +40,7 @@ use futures::{StreamExt, stream};
 use modelardb_test::data_generation;
 use modelardb_test::table::{self, NORMAL_TABLE_NAME, TIME_SERIES_TABLE_NAME};
 use modelardb_types::flight::protocol;
-use modelardb_types::types::ErrorBound;
+use modelardb_types::types::{ErrorBound, Node, ServerMode};
 use prost::Message;
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -111,13 +111,13 @@ impl TestContext {
         self.client = Self::create_client(self.port).await;
     }
 
-    /// Create a server that stores data in `local_data_folder` and listens on `port` and ensure it
-    /// is ready to receive requests.
-    async fn create_server(local_data_folder: &TempDir, port: u16) -> Child {
+    /// Create a server that stores data in the local data folder at `temp_dir` and listens on
+    /// `port` and ensure it is ready to receive requests.
+    async fn create_server(temp_dir: &TempDir, port: u16) -> Child {
         // The server's stdout and stderr are piped so the log messages (stdout) and expected errors
         // (stderr) are not printed when all the tests are run using the "cargo test" command.
         // modelardbd is run using dev-release so the tests can use larger more realistic data sets.
-        let local_data_folder = local_data_folder.path().to_str().unwrap();
+        let local_data_folder_path = temp_dir.path().to_str().unwrap();
         let mut server = Command::new("cargo")
             .env("MODELARDBD_PORT", port.to_string())
             .args([
@@ -127,7 +127,7 @@ impl TestContext {
                 "--bin",
                 "modelardbd",
                 "edge",
-                local_data_folder,
+                local_data_folder_path,
             ])
             .kill_on_drop(true)
             .stdout(Stdio::piped())
@@ -831,7 +831,7 @@ async fn test_can_optimize_normal_table() {
     .await;
 
     // ingest_time_series_and_flush_data() writes one file. Ingest and flush three more times so
-    // there are four small files to compact.
+    // there are four small files to merge.
     for _ in 0..3 {
         let flight_data = TestContext::create_flight_data_from_time_series(
             NORMAL_TABLE_NAME.to_owned(),
@@ -886,7 +886,7 @@ async fn test_can_optimize_time_series_table() {
     .await;
 
     // ingest_time_series_and_flush_data() writes one file per field column partition. ingest and
-    // flush three more times so each partition has four small files to compact.
+    // flush three more times so each partition has four small files to merge.
     for _ in 0..3 {
         let flight_data = TestContext::create_flight_data_from_time_series(
             TIME_SERIES_TABLE_NAME.to_owned(),
@@ -921,7 +921,7 @@ async fn test_can_optimize_time_series_table() {
         .await
         .unwrap();
 
-    // The four files in the partition should be compacted into a single active file.
+    // The four files in the partition should be merged into a single active file.
     let files = std::fs::read_dir(&column_path).unwrap();
     assert_eq!(files.count(), 1);
 }
@@ -988,6 +988,8 @@ async fn test_can_list_actions() {
             "FlushNode",
             "GetConfiguration",
             "KillNode",
+            "ListNodes",
+            "NodeMetrics",
             "NodeType",
             "UpdateConfiguration",
         ]
@@ -1410,7 +1412,7 @@ async fn test_can_get_configuration() {
     let configuration = protocol::Configuration::decode(configuration_bytes).unwrap();
 
     assert_eq!(
-        configuration.multivariate_reserved_memory_in_bytes,
+        configuration.ingested_reserved_memory_in_bytes,
         512 * 1024 * 1024
     );
     assert_eq!(
@@ -1429,6 +1431,14 @@ async fn test_can_get_configuration() {
         configuration.segment_size_threshold_in_bytes,
         64 * 1024 * 1024
     );
+    assert_eq!(
+        configuration.optimize_target_file_size_in_bytes,
+        64 * 1024 * 1024
+    );
+    assert_eq!(
+        configuration.vacuum_retention_period_in_seconds,
+        60 * 60 * 24 * 7
+    );
     assert_eq!(configuration.ingestion_threads, 1);
     assert_eq!(configuration.compression_threads, 1);
     assert_eq!(configuration.writer_threads, 1);
@@ -1436,16 +1446,13 @@ async fn test_can_get_configuration() {
 }
 
 #[tokio::test]
-async fn test_can_update_multivariate_reserved_memory_in_bytes() {
+async fn test_can_update_ingested_reserved_memory_in_bytes() {
     let updated_configuration = update_and_get_configuration(
-        protocol::update_configuration::Setting::MultivariateReservedMemoryInBytes as i32,
+        protocol::update_configuration::Setting::IngestedReservedMemoryInBytes as i32,
     )
     .await;
 
-    assert_eq!(
-        updated_configuration.multivariate_reserved_memory_in_bytes,
-        1
-    );
+    assert_eq!(updated_configuration.ingested_reserved_memory_in_bytes, 1);
 }
 
 #[tokio::test]
@@ -1479,6 +1486,26 @@ async fn test_can_update_segment_size_threshold_in_bytes() {
     .await;
 
     assert_eq!(updated_configuration.segment_size_threshold_in_bytes, 1);
+}
+
+#[tokio::test]
+async fn test_can_update_optimize_target_file_size_in_bytes() {
+    let updated_configuration = update_and_get_configuration(
+        protocol::update_configuration::Setting::OptimizeTargetFileSizeInBytes as i32,
+    )
+    .await;
+
+    assert_eq!(updated_configuration.optimize_target_file_size_in_bytes, 1);
+}
+
+#[tokio::test]
+async fn test_can_update_vacuum_retention_period_in_seconds() {
+    let updated_configuration = update_and_get_configuration(
+        protocol::update_configuration::Setting::VacuumRetentionPeriodInSeconds as i32,
+    )
+    .await;
+
+    assert_eq!(updated_configuration.vacuum_retention_period_in_seconds, 1);
 }
 
 async fn update_and_get_configuration(setting: i32) -> protocol::Configuration {
@@ -1517,10 +1544,12 @@ async fn test_cannot_update_non_updatable_setting() {
 #[tokio::test]
 async fn test_cannot_update_non_nullable_setting_with_null_value() {
     for setting in [
-        protocol::update_configuration::Setting::MultivariateReservedMemoryInBytes as i32,
+        protocol::update_configuration::Setting::IngestedReservedMemoryInBytes as i32,
         protocol::update_configuration::Setting::UncompressedReservedMemoryInBytes as i32,
         protocol::update_configuration::Setting::CompressedReservedMemoryInBytes as i32,
         protocol::update_configuration::Setting::SegmentSizeThresholdInBytes as i32,
+        protocol::update_configuration::Setting::OptimizeTargetFileSizeInBytes as i32,
+        protocol::update_configuration::Setting::VacuumRetentionPeriodInSeconds as i32,
     ] {
         update_configuration_and_assert_error(
             setting,
@@ -1584,4 +1613,54 @@ async fn test_can_create_time_series_table_from_metadata() {
 
     let retrieved_table_names = test_context.retrieve_all_table_names().await.unwrap();
     assert_eq!(retrieved_table_names[0], TIME_SERIES_TABLE_NAME);
+}
+
+#[tokio::test]
+async fn test_can_list_nodes() {
+    let mut test_context = TestContext::new().await;
+    let nodes_bytes = test_context.retrieve_action_bytes("ListNodes").await;
+    let nodes =
+        modelardb_types::flight::deserialize_and_extract_cluster_nodes(&nodes_bytes).unwrap();
+
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(
+        nodes[0],
+        Node::new(
+            format!("grpc://{HOST}:{}", test_context.port),
+            ServerMode::Edge
+        )
+    );
+}
+
+#[tokio::test]
+async fn test_can_get_node_metrics() {
+    let mut test_context = TestContext::new().await;
+    let metrics_bytes = test_context.retrieve_action_bytes("NodeMetrics").await;
+    let metrics = protocol::NodeMetrics::decode(metrics_bytes).unwrap();
+
+    // Only stable fields are asserted exactly. CPU usage, used memory, and disk usage vary per run
+    // and per machine.
+    assert!(metrics.cpu_usage_percentage > 0.0);
+    assert!(metrics.cpu_count > 0);
+
+    assert!(metrics.used_memory_in_bytes > 0);
+    assert!(metrics.total_memory_in_bytes > 0);
+
+    assert!(metrics.used_disk_space_in_bytes > 0);
+    assert!(metrics.total_disk_space_in_bytes > 0);
+
+    assert_eq!(metrics.ingested_used_memory_in_bytes, 0);
+    assert_eq!(metrics.ingested_reserved_memory_in_bytes, 512 * 1024 * 1024);
+
+    assert_eq!(metrics.uncompressed_used_memory_in_bytes, 0);
+    assert_eq!(
+        metrics.uncompressed_reserved_memory_in_bytes,
+        512 * 1024 * 1024
+    );
+
+    assert_eq!(metrics.compressed_used_memory_in_bytes, 0);
+    assert_eq!(
+        metrics.compressed_reserved_memory_in_bytes,
+        512 * 1024 * 1024
+    );
 }

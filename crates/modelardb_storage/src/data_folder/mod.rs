@@ -48,11 +48,11 @@ use modelardb_types::types::{
     ArrowValue, CloudCredentials, ErrorBound, GeneratedColumn, MAX_RETENTION_PERIOD_IN_SECONDS,
     TimeSeriesTableMetadata,
 };
-use object_store::ObjectStore;
 use object_store::aws::AmazonS3Builder;
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
 use object_store::path::Path;
+use object_store::{ObjectStore, ObjectStoreExt};
 use url::Url;
 
 use crate::data_folder::delta_table_writer::DeltaTableWriter;
@@ -66,8 +66,9 @@ enum TableType {
     TimeSeriesTable,
 }
 
-/// Functionality for managing Delta Lake tables in a local folder or an object store.
-#[derive(Clone)]
+/// Functionality for managing Delta Lake tables in a local folder or an object store. A single
+/// instance should be shared through an [`Arc`], so the cache and session context are only
+/// created once.
 pub struct DataFolder {
     /// URL to access the root of the Delta Lake.
     location: String,
@@ -78,7 +79,7 @@ pub struct DataFolder {
     /// Cache of Delta tables to avoid opening the same table multiple times.
     delta_table_cache: DashMap<String, DeltaTable>,
     /// Session context used to query the tables using Apache DataFusion.
-    session_context: Arc<SessionContext>,
+    session_context: SessionContext,
 }
 
 impl DataFolder {
@@ -261,7 +262,7 @@ impl DataFolder {
             storage_options,
             object_store,
             delta_table_cache: DashMap::new(),
-            session_context: Arc::new(crate::create_session_context()),
+            session_context: crate::create_session_context(),
         };
 
         data_folder.create_and_register_metadata_tables().await?;
@@ -685,12 +686,12 @@ impl DataFolder {
         Ok(())
     }
 
-    /// Optimize the Delta Lake table with `table_name` by compacting its many small files into
+    /// Optimize the Delta Lake table with `table_name` by merging its many small files into
     /// fewer larger files of approximately `maybe_target_size_in_bytes` bytes. If a target size is
-    /// not given, a default target size of 64 MiB is used. Compaction only rewrites files smaller
+    /// not given, a default target size of 64 MiB is used. Optimize only rewrites files smaller
     /// than the target, so it is safe to call repeatedly. Note that the small files are only marked
     /// as removed and are not deleted from disk until the table is vacuumed. If the target size is
-    /// zero, the table does not exist, or the files could not be compacted, a
+    /// zero, the table does not exist, or the files could not be merged, a
     /// [`ModelarDbStorageError`] is returned.
     pub async fn optimize_table(
         &self,
@@ -709,6 +710,21 @@ impl DataFolder {
         delta_table.optimize().with_target_size(target_size).await?;
 
         Ok(())
+    }
+
+    /// Return the size in bytes of each Apache Parquet file that makes up the Delta Lake table with
+    /// `table_name`. If the table does not exist or the size of a file could not be read, a
+    /// [`ModelarDbStorageError`] is returned.
+    pub async fn table_file_sizes(&self, table_name: &str) -> Result<Vec<u64>> {
+        let delta_table = self.delta_table(table_name).await?;
+        let object_store = delta_table.object_store();
+
+        let mut file_sizes_in_bytes = Vec::new();
+        for file_path in delta_table.get_files_by_partitions(&[]).await? {
+            file_sizes_in_bytes.push(object_store.head(&file_path).await?.size);
+        }
+
+        Ok(file_sizes_in_bytes)
     }
 
     /// Return a [`DeltaTableWriter`] for writing to the table with `table_name` in the Delta Lake,
@@ -809,10 +825,17 @@ impl DataFolder {
     /// [`ModelarDbStorageError`] if a connection to the Delta Lake cannot be established or the
     /// table does not exist.
     async fn delta_table_from_path(&self, table_path: &str) -> Result<DeltaTable> {
-        // Use the cache if possible and load to get the latest table data.
-        if let Some(mut delta_table) = self.delta_table_cache.get_mut(table_path) {
+        // Clone the cached table if possible and drop the DashMap guard before loading. load() is
+        // an async IO call, and get_mut() holds a write guard on the shard, so loading while
+        // holding it would serialize access to every table in the same shard.
+        let maybe_delta_table = self
+            .delta_table_cache
+            .get(table_path)
+            .map(|delta_table| delta_table.clone());
+
+        if let Some(mut delta_table) = maybe_delta_table {
             delta_table.load().await?;
-            Ok(delta_table.clone())
+            Ok(delta_table)
         } else {
             // Return a clear error message if the table does not exist instead of the internal
             // error message from deltalake.
@@ -1604,7 +1627,7 @@ mod tests {
             .await
             .unwrap();
 
-        // The small files should be compacted into a single active file with no rows lost or
+        // The small files should be merged into a single active file with no rows lost or
         // duplicated.
         assert_eq!(active_file_count(&data_folder, "normal_table_1").await, 1);
         assert_eq!(row_count(&data_folder, "normal_table_1").await, rows_before);
@@ -1636,7 +1659,7 @@ mod tests {
             .await
             .unwrap();
 
-        // The small files should be compacted into a single active file with no rows lost or
+        // The small files should be merged into a single active file with no rows lost or
         // duplicated.
         assert_eq!(
             active_file_count(&data_folder, TIME_SERIES_TABLE_NAME).await,
@@ -1675,7 +1698,7 @@ mod tests {
         assert_eq!(files_before, 4);
 
         // A one-byte target is smaller than every existing file, so none of them are candidates for
-        // compaction, and the files should be left untouched.
+        // merging, and the files should be left untouched.
         data_folder
             .optimize_table("normal_table_1", Some(1))
             .await

@@ -36,6 +36,26 @@ use tonic::transport::Endpoint;
 use crate::context::Context;
 use crate::error::{ModelarDbServerError, Result};
 
+/// The different possible modes that a ModelarDB server can be deployed in, assigned when the
+/// server is started.
+#[derive(Clone)]
+pub(crate) enum ClusterMode {
+    SingleNode(Node),
+    MultiNode(Cluster),
+}
+
+impl ClusterMode {
+    /// Return all nodes in the deployment. A single node returns only itself, while a node in a
+    /// cluster returns every node in the cluster. If the nodes could not be retrieved, return
+    /// [`ModelarDbServerError`].
+    pub(crate) async fn nodes(&self) -> Result<Vec<Node>> {
+        match self {
+            ClusterMode::SingleNode(node) => Ok(vec![node.clone()]),
+            ClusterMode::MultiNode(cluster) => cluster.nodes().await,
+        }
+    }
+}
+
 /// Stores the node that represents the local system and allows for performing operations that need
 /// to be applied to every peer node in the cluster.
 #[derive(Clone)]
@@ -48,7 +68,7 @@ pub(crate) struct Cluster {
     /// The remote data folder that each node in the cluster should be synchronized with.
     /// When a table is created, dropped, vacuumed, or truncated, it is done in the
     /// remote data folder first.
-    remote_data_folder: DataFolder,
+    remote_data_folder: Arc<DataFolder>,
 }
 
 impl Cluster {
@@ -56,7 +76,7 @@ impl Cluster {
     /// It is assumed that `node` corresponds to the local system running `modelardbd`. If the
     /// cluster metadata tables do not exist and could not be created or the node could not be
     /// saved, return [`ModelarDbServerError`].
-    pub(crate) async fn try_new(node: Node, remote_data_folder: DataFolder) -> Result<Self> {
+    pub(crate) async fn try_new(node: Node, remote_data_folder: Arc<DataFolder>) -> Result<Self> {
         remote_data_folder
             .create_and_register_cluster_metadata_tables()
             .await?;
@@ -357,10 +377,19 @@ impl Cluster {
         Ok(url.to_owned())
     }
 
+    /// Return all nodes currently in the cluster. If the nodes could not be retrieved, return
+    /// [`ModelarDbServerError`].
+    pub(crate) async fn nodes(&self) -> Result<Vec<Node>> {
+        self.remote_data_folder
+            .nodes()
+            .await
+            .map_err(|error| error.into())
+    }
+
     /// Return all nodes in the cluster except the node that was saved when the [`Cluster`] was
     /// created. If the nodes could not be retrieved, return [`ModelarDbServerError`].
     async fn peer_nodes(&self) -> Result<Vec<Node>> {
-        let nodes = self.remote_data_folder.nodes().await?;
+        let nodes = self.nodes().await?;
 
         Ok(nodes
             .into_iter()
@@ -485,8 +514,8 @@ mod test {
     use modelardb_types::types::{ArrowTimestamp, ArrowValue, ErrorBound, ServerMode};
     use tempfile::TempDir;
 
+    use crate::ServerArgs;
     use crate::data_folders::DataFolders;
-    use crate::{ClusterMode, ServerArgs};
 
     // Tests for Cluster.
     #[tokio::test]
@@ -499,24 +528,19 @@ mod test {
 
         // Create a normal table in the remote data folder that should be retrieved and created
         // in the local data folder and one that already exists.
-        create_normal_table(
-            "normal_table_1",
-            "column",
-            data_folders.local_data_folder.clone(),
-        )
-        .await;
+        create_normal_table("normal_table_1", "column", &data_folders.local_data_folder).await;
 
         create_normal_table(
             "normal_table_1",
             "column",
-            data_folders.maybe_remote_data_folder.clone().unwrap(),
+            data_folders.maybe_remote_data_folder.as_ref().unwrap(),
         )
         .await;
 
         create_normal_table(
             "normal_table_2",
             "column",
-            data_folders.maybe_remote_data_folder.clone().unwrap(),
+            data_folders.maybe_remote_data_folder.as_ref().unwrap(),
         )
         .await;
 
@@ -538,17 +562,12 @@ mod test {
 
         // Create a normal table in the local data folder with the same name as a normal table in
         // the remote data folder, but with a different schema.
-        create_normal_table(
-            NORMAL_TABLE_NAME,
-            "local",
-            data_folders.local_data_folder.clone(),
-        )
-        .await;
+        create_normal_table(NORMAL_TABLE_NAME, "local", &data_folders.local_data_folder).await;
 
         create_normal_table(
             NORMAL_TABLE_NAME,
             "remote",
-            data_folders.maybe_remote_data_folder.clone().unwrap(),
+            data_folders.maybe_remote_data_folder.as_ref().unwrap(),
         )
         .await;
 
@@ -576,21 +595,21 @@ mod test {
         create_time_series_table(
             "time_series_table_1",
             "field",
-            data_folders.local_data_folder.clone(),
+            &data_folders.local_data_folder,
         )
         .await;
 
         create_time_series_table(
             "time_series_table_1",
             "field",
-            data_folders.maybe_remote_data_folder.clone().unwrap(),
+            data_folders.maybe_remote_data_folder.as_ref().unwrap(),
         )
         .await;
 
         create_time_series_table(
             "time_series_table_2",
             "field",
-            data_folders.maybe_remote_data_folder.clone().unwrap(),
+            data_folders.maybe_remote_data_folder.as_ref().unwrap(),
         )
         .await;
 
@@ -615,14 +634,14 @@ mod test {
         create_time_series_table(
             TIME_SERIES_TABLE_NAME,
             "local",
-            data_folders.local_data_folder.clone(),
+            &data_folders.local_data_folder,
         )
         .await;
 
         create_time_series_table(
             TIME_SERIES_TABLE_NAME,
             "remote",
-            data_folders.maybe_remote_data_folder.clone().unwrap(),
+            data_folders.maybe_remote_data_folder.as_ref().unwrap(),
         )
         .await;
 
@@ -646,17 +665,12 @@ mod test {
         let data_folders = context.data_folders.clone();
 
         // Create tables in the local data folder that are not in the remote data folder.
-        create_normal_table(
-            NORMAL_TABLE_NAME,
-            "local",
-            data_folders.local_data_folder.clone(),
-        )
-        .await;
+        create_normal_table(NORMAL_TABLE_NAME, "local", &data_folders.local_data_folder).await;
 
         create_time_series_table(
             TIME_SERIES_TABLE_NAME,
             "local",
-            data_folders.local_data_folder.clone(),
+            &data_folders.local_data_folder,
         )
         .await;
 
@@ -673,7 +687,7 @@ mod test {
 
     /// Create a normal table named `table_name` with a single column named `column_name` in
     /// `data_folder`.
-    async fn create_normal_table(table_name: &str, column_name: &str, data_folder: DataFolder) {
+    async fn create_normal_table(table_name: &str, column_name: &str, data_folder: &DataFolder) {
         let schema = Schema::new(vec![Field::new(column_name, ArrowValue::DATA_TYPE, false)]);
 
         data_folder
@@ -687,7 +701,7 @@ mod test {
     async fn create_time_series_table(
         table_name: &str,
         column_name: &str,
-        data_folder: DataFolder,
+        data_folder: &DataFolder,
     ) {
         let query_schema = Arc::new(Schema::new(vec![
             Field::new("timestamp", ArrowTimestamp::DATA_TYPE, false),
@@ -724,7 +738,7 @@ mod test {
     /// data folder in the context uses a local [`DataFolder`].
     async fn create_context(local_temp_dir: &TempDir, remote_temp_dir: &TempDir) -> Arc<Context> {
         let temp_dir_url = local_temp_dir.path().to_str().unwrap();
-        let local_data_folder = DataFolder::open_local_url(temp_dir_url).await.unwrap();
+        let local_data_folder = Arc::new(DataFolder::open_local_url(temp_dir_url).await.unwrap());
 
         let edge_node = Node::new("edge".to_owned(), ServerMode::Edge);
         let cluster = create_cluster_with_node(remote_temp_dir, edge_node).await;
@@ -736,7 +750,7 @@ mod test {
                     Some(cluster.remote_data_folder.clone()),
                     local_data_folder,
                 ),
-                ClusterMode::MultiNode(Box::new(cluster)),
+                ClusterMode::MultiNode(cluster),
                 &ServerArgs::parse_from(["modelardbd", "edge", "data", "s3://bucket"]),
             )
             .await
@@ -813,7 +827,7 @@ mod test {
     /// Create a [`Cluster`] that uses a local [`DataFolder`] for the remote data folder.
     async fn create_cluster_with_node(temp_dir: &TempDir, node: Node) -> Cluster {
         let temp_dir_url = temp_dir.path().to_str().unwrap();
-        let local_data_folder = DataFolder::open_local_url(temp_dir_url).await.unwrap();
+        let local_data_folder = Arc::new(DataFolder::open_local_url(temp_dir_url).await.unwrap());
 
         Cluster::try_new(node, local_data_folder.clone())
             .await

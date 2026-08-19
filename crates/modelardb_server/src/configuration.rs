@@ -27,15 +27,17 @@ use std::sync::Arc;
 use modelardb_storage::data_folder::DataFolder;
 use modelardb_storage::write_ahead_log::WriteAheadLog;
 use modelardb_types::flight::protocol;
+use modelardb_types::types::MAX_RETENTION_PERIOD_IN_SECONDS;
 use object_store::path::Path;
 use object_store::{Error, ObjectStoreExt, PutPayload};
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
+use crate::ServerArgs;
+use crate::cluster::ClusterMode;
 use crate::error::{ModelarDbServerError, Result};
 use crate::storage::StorageEngine;
-use crate::{ClusterMode, ServerArgs};
 
 const CONFIGURATION_FILE_NAME: &str = "modelardbd.toml";
 
@@ -51,8 +53,8 @@ pub(crate) enum WalMode {
 /// only be done through the [`ConfigurationManager`].
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct Configuration {
-    /// Amount of memory to reserve for storing multivariate time series.
-    multivariate_reserved_memory_in_bytes: u64,
+    /// Amount of memory to reserve for storing ingested time series.
+    ingested_reserved_memory_in_bytes: u64,
     /// Amount of memory to reserve for storing uncompressed data buffers.
     uncompressed_reserved_memory_in_bytes: u64,
     /// Amount of memory to reserve for storing compressed data buffers.
@@ -63,6 +65,14 @@ struct Configuration {
     /// The approximate maximum size, in bytes, of a single WAL segment file before it is closed and
     /// a new one is started.
     segment_size_threshold_in_bytes: u64,
+    /// Target size, in bytes, of the files produced when automatically compacting a table's
+    /// storage. This is also the default value used when an OPTIMIZE query is executed without an
+    /// explicit target size.
+    optimize_target_file_size_in_bytes: u64,
+    /// Retention period, in seconds, used when automatically vacuuming a table during compaction.
+    /// This is also the default value used when a VACUUM query is executed without an explicit
+    /// retention period.
+    vacuum_retention_period_in_seconds: u64,
     /// Number of threads to allocate for converting multivariate time series to univariate
     /// time series.
     ingestion_threads: u8,
@@ -79,8 +89,8 @@ impl Configuration {
     /// Update the configuration parameters with the corresponding flags or environment variables
     /// from the command line if they are set.
     fn update_from_args(&mut self, args: &ServerArgs) {
-        if let Some(value) = args.multivariate_reserved_memory_in_bytes {
-            self.multivariate_reserved_memory_in_bytes = value;
+        if let Some(value) = args.ingested_reserved_memory_in_bytes {
+            self.ingested_reserved_memory_in_bytes = value;
         }
 
         if let Some(value) = args.uncompressed_reserved_memory_in_bytes {
@@ -99,6 +109,14 @@ impl Configuration {
             self.segment_size_threshold_in_bytes = value;
         }
 
+        if let Some(value) = args.optimize_target_file_size_in_bytes {
+            self.optimize_target_file_size_in_bytes = value;
+        }
+
+        if let Some(value) = args.vacuum_retention_period_in_seconds {
+            self.vacuum_retention_period_in_seconds = value;
+        }
+
         if let Some(value) = args.wal_enabled {
             self.wal_enabled = value;
         }
@@ -114,9 +132,21 @@ impl Configuration {
         if self.ingestion_threads != 1 || self.compression_threads != 1 || self.writer_threads != 1
         {
             return Err(ModelarDbServerError::InvalidState(
-                "Only one thread per component is currently supported.".to_string(),
+                "Only one thread per component is currently supported.".to_owned(),
             ));
         };
+
+        if self.optimize_target_file_size_in_bytes == 0 {
+            return Err(ModelarDbServerError::InvalidState(
+                "Optimize target file size must be greater than zero.".to_owned(),
+            ));
+        }
+
+        if self.vacuum_retention_period_in_seconds > MAX_RETENTION_PERIOD_IN_SECONDS {
+            return Err(ModelarDbServerError::InvalidState(format!(
+                "Vacuum retention period cannot be more than {MAX_RETENTION_PERIOD_IN_SECONDS} seconds."
+            )));
+        }
 
         Ok(())
     }
@@ -142,11 +172,13 @@ impl Configuration {
 impl Default for Configuration {
     fn default() -> Self {
         Self {
-            multivariate_reserved_memory_in_bytes: 512 * 1024 * 1024,
+            ingested_reserved_memory_in_bytes: 512 * 1024 * 1024,
             uncompressed_reserved_memory_in_bytes: 512 * 1024 * 1024,
             compressed_reserved_memory_in_bytes: 512 * 1024 * 1024,
             transfer_batch_size_in_bytes: Some(64 * 1024 * 1024),
             segment_size_threshold_in_bytes: 64 * 1024 * 1024,
+            optimize_target_file_size_in_bytes: 64 * 1024 * 1024,
+            vacuum_retention_period_in_seconds: 60 * 60 * 24 * 7,
             ingestion_threads: 1,
             compression_threads: 1,
             writer_threads: 1,
@@ -164,7 +196,7 @@ pub struct ConfigurationManager {
     /// The mode of the write-ahead log used to determine whether data is logged before ingestion.
     wal_mode: WalMode,
     /// The local data folder that stores the configuration file at the root.
-    local_data_folder: DataFolder,
+    local_data_folder: Arc<DataFolder>,
     /// The configuration of the system. This is stored in a separate type to allow for easier
     /// serialization and deserialization.
     configuration: Configuration,
@@ -177,7 +209,7 @@ impl ConfigurationManager {
     /// if the corresponding CLI flags or environment variables are set. If the configuration file
     /// could not be read or created, [`ModelarDbServerError`] is returned.
     pub async fn try_new(
-        local_data_folder: DataFolder,
+        local_data_folder: Arc<DataFolder>,
         cluster_mode: ClusterMode,
         args: &ServerArgs,
     ) -> Result<Self> {
@@ -237,31 +269,31 @@ impl ConfigurationManager {
         &self.wal_mode
     }
 
-    pub(crate) fn multivariate_reserved_memory_in_bytes(&self) -> u64 {
-        self.configuration.multivariate_reserved_memory_in_bytes
+    pub(crate) fn ingested_reserved_memory_in_bytes(&self) -> u64 {
+        self.configuration.ingested_reserved_memory_in_bytes
     }
 
-    /// Set the new value and update the amount of memory for multivariate data in the storage
+    /// Set the new value and update the amount of memory for ingested data in the storage
     /// engine. If the new configuration could not be saved to the configuration file, return
     /// [`ModelarDbServerError`].
-    pub(crate) async fn set_multivariate_reserved_memory_in_bytes(
+    pub(crate) async fn set_ingested_reserved_memory_in_bytes(
         &mut self,
-        new_multivariate_reserved_memory_in_bytes: u64,
+        new_ingested_reserved_memory_in_bytes: u64,
         storage_engine: Arc<RwLock<StorageEngine>>,
     ) -> Result<()> {
         // Since the storage engine only keeps track of the remaining reserved memory, calculate
         // how much the value should change.
-        let value_change = new_multivariate_reserved_memory_in_bytes as i64
-            - self.configuration.multivariate_reserved_memory_in_bytes as i64;
+        let value_change = new_ingested_reserved_memory_in_bytes as i64
+            - self.configuration.ingested_reserved_memory_in_bytes as i64;
 
         storage_engine
             .write()
             .await
-            .adjust_multivariate_remaining_memory_in_bytes(value_change)
+            .adjust_ingested_remaining_memory_in_bytes(value_change)
             .await;
 
-        self.configuration.multivariate_reserved_memory_in_bytes =
-            new_multivariate_reserved_memory_in_bytes;
+        self.configuration.ingested_reserved_memory_in_bytes =
+            new_ingested_reserved_memory_in_bytes;
 
         self.configuration
             .save_to_toml(&self.local_data_folder)
@@ -389,6 +421,71 @@ impl ConfigurationManager {
             .await
     }
 
+    pub(crate) fn optimize_target_file_size_in_bytes(&self) -> u64 {
+        self.configuration.optimize_target_file_size_in_bytes
+    }
+
+    /// Set the target file size used by the data storage compactor and as the default for OPTIMIZE
+    /// queries without an explicit target size. If the new value is zero or the new configuration
+    /// could not be saved to the configuration file, return [`ModelarDbServerError`].
+    pub(crate) async fn set_optimize_target_file_size_in_bytes(
+        &mut self,
+        new_optimize_target_file_size_in_bytes: u64,
+        storage_engine: Arc<RwLock<StorageEngine>>,
+    ) -> Result<()> {
+        if new_optimize_target_file_size_in_bytes == 0 {
+            return Err(ModelarDbServerError::InvalidArgument(
+                "Optimize target file size must be greater than zero.".to_owned(),
+            ));
+        }
+
+        storage_engine
+            .write()
+            .await
+            .set_optimize_target_file_size_in_bytes(new_optimize_target_file_size_in_bytes)
+            .await;
+
+        self.configuration.optimize_target_file_size_in_bytes =
+            new_optimize_target_file_size_in_bytes;
+
+        self.configuration
+            .save_to_toml(&self.local_data_folder)
+            .await
+    }
+
+    pub(crate) fn vacuum_retention_period_in_seconds(&self) -> u64 {
+        self.configuration.vacuum_retention_period_in_seconds
+    }
+
+    /// Set the retention period used by the data storage compactor and as the default for VACUUM
+    /// queries without an explicit retention period. If the new value is larger than
+    /// [`MAX_RETENTION_PERIOD_IN_SECONDS`] or the new configuration could not be saved to the
+    /// configuration file, return [`ModelarDbServerError`].
+    pub(crate) async fn set_vacuum_retention_period_in_seconds(
+        &mut self,
+        new_vacuum_retention_period_in_seconds: u64,
+        storage_engine: Arc<RwLock<StorageEngine>>,
+    ) -> Result<()> {
+        if new_vacuum_retention_period_in_seconds > MAX_RETENTION_PERIOD_IN_SECONDS {
+            return Err(ModelarDbServerError::InvalidArgument(format!(
+                "Vacuum retention period cannot be more than {MAX_RETENTION_PERIOD_IN_SECONDS} seconds."
+            )));
+        }
+
+        storage_engine
+            .write()
+            .await
+            .set_vacuum_retention_period_in_seconds(new_vacuum_retention_period_in_seconds)
+            .await;
+
+        self.configuration.vacuum_retention_period_in_seconds =
+            new_vacuum_retention_period_in_seconds;
+
+        self.configuration
+            .save_to_toml(&self.local_data_folder)
+            .await
+    }
+
     pub(crate) fn ingestion_threads(&self) -> u8 {
         self.configuration.ingestion_threads
     }
@@ -405,9 +502,7 @@ impl ConfigurationManager {
     /// protobuf message and serialize it.
     pub(crate) fn encode_and_serialize(&self) -> Vec<u8> {
         let configuration = protocol::Configuration {
-            multivariate_reserved_memory_in_bytes: self
-                .configuration
-                .multivariate_reserved_memory_in_bytes,
+            ingested_reserved_memory_in_bytes: self.configuration.ingested_reserved_memory_in_bytes,
             uncompressed_reserved_memory_in_bytes: self
                 .configuration
                 .uncompressed_reserved_memory_in_bytes,
@@ -420,6 +515,12 @@ impl ConfigurationManager {
             compression_threads: self.configuration.compression_threads as u32,
             writer_threads: self.configuration.writer_threads as u32,
             wal_enabled: self.configuration.wal_enabled,
+            optimize_target_file_size_in_bytes: self
+                .configuration
+                .optimize_target_file_size_in_bytes,
+            vacuum_retention_period_in_seconds: self
+                .configuration
+                .vacuum_retention_period_in_seconds,
         };
 
         configuration.encode_to_vec()
@@ -461,11 +562,13 @@ mod tests {
         let local_data_folder = DataFolder::open_local_url(local_url).await.unwrap();
 
         let existing_configuration = Configuration {
-            multivariate_reserved_memory_in_bytes: 1,
+            ingested_reserved_memory_in_bytes: 1,
             uncompressed_reserved_memory_in_bytes: 1,
             compressed_reserved_memory_in_bytes: 1,
             transfer_batch_size_in_bytes: Some(1),
             segment_size_threshold_in_bytes: 1,
+            optimize_target_file_size_in_bytes: 1,
+            vacuum_retention_period_in_seconds: 1,
             ..Configuration::default()
         };
 
@@ -487,7 +590,7 @@ mod tests {
     async fn test_invalid_configuration_in_configuration_file() {
         let temp_dir = tempfile::tempdir().unwrap();
         let local_url = temp_dir.path().to_str().unwrap();
-        let local_data_folder = DataFolder::open_local_url(local_url).await.unwrap();
+        let local_data_folder = Arc::new(DataFolder::open_local_url(local_url).await.unwrap());
 
         // Multiple threads per component are not supported.
         let invalid_configuration = Configuration {
@@ -500,9 +603,10 @@ mod tests {
             .await
             .unwrap();
 
+        let node = Node::new("edge".to_owned(), ServerMode::Edge);
         let result = ConfigurationManager::try_new(
             local_data_folder,
-            ClusterMode::SingleNode,
+            ClusterMode::SingleNode(node),
             &default_args(),
         )
         .await;
@@ -517,15 +621,16 @@ mod tests {
     async fn test_invalid_toml_in_configuration_file() {
         let temp_dir = tempfile::tempdir().unwrap();
         let local_url = temp_dir.path().to_str().unwrap();
-        let local_data_folder = DataFolder::open_local_url(local_url).await.unwrap();
+        let local_data_folder = Arc::new(DataFolder::open_local_url(local_url).await.unwrap());
 
         // Write invalid TOML to the configuration file.
         let path = temp_dir.path().join(CONFIGURATION_FILE_NAME);
         std::fs::write(path, "invalid_toml").unwrap();
 
+        let node = Node::new("edge".to_owned(), ServerMode::Edge);
         let result = ConfigurationManager::try_new(
             local_data_folder,
-            ClusterMode::SingleNode,
+            ClusterMode::SingleNode(node),
             &default_args(),
         )
         .await;
@@ -539,8 +644,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_validate_rejects_zero_optimize_target_file_size() {
+        let configuration = Configuration {
+            optimize_target_file_size_in_bytes: 0,
+            ..Configuration::default()
+        };
+
+        let result = configuration.validate();
+
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "Invalid State Error: Optimize target file size must be greater than zero."
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_too_large_vacuum_retention_period() {
+        let configuration = Configuration {
+            vacuum_retention_period_in_seconds: MAX_RETENTION_PERIOD_IN_SECONDS + 1,
+            ..Configuration::default()
+        };
+
+        let result = configuration.validate();
+
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            format!(
+                "Invalid State Error: Vacuum retention period cannot be more than {} seconds.",
+                MAX_RETENTION_PERIOD_IN_SECONDS
+            )
+        );
+    }
+
     #[tokio::test]
-    async fn test_set_multivariate_reserved_memory_in_bytes() {
+    async fn test_set_ingested_reserved_memory_in_bytes() {
         let temp_dir = tempfile::tempdir().unwrap();
         let (storage_engine, configuration_manager) = create_components(&temp_dir).await;
 
@@ -548,7 +686,7 @@ mod tests {
             configuration_manager
                 .read()
                 .await
-                .multivariate_reserved_memory_in_bytes(),
+                .ingested_reserved_memory_in_bytes(),
             512 * 1024 * 1024
         );
 
@@ -556,7 +694,7 @@ mod tests {
         configuration_manager
             .write()
             .await
-            .set_multivariate_reserved_memory_in_bytes(new_value, storage_engine)
+            .set_ingested_reserved_memory_in_bytes(new_value, storage_engine)
             .await
             .unwrap();
 
@@ -564,13 +702,13 @@ mod tests {
             configuration_manager
                 .read()
                 .await
-                .multivariate_reserved_memory_in_bytes(),
+                .ingested_reserved_memory_in_bytes(),
             new_value
         );
 
         let configuration_from_file = configuration_from_file(&temp_dir).await;
         assert_eq!(
-            configuration_from_file.multivariate_reserved_memory_in_bytes,
+            configuration_from_file.ingested_reserved_memory_in_bytes,
             new_value
         );
     }
@@ -737,6 +875,118 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_set_optimize_target_file_size_in_bytes() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (storage_engine, configuration_manager) = create_components(&temp_dir).await;
+
+        assert_eq!(
+            configuration_manager
+                .read()
+                .await
+                .optimize_target_file_size_in_bytes(),
+            64 * 1024 * 1024
+        );
+
+        let new_value = 1024;
+        configuration_manager
+            .write()
+            .await
+            .set_optimize_target_file_size_in_bytes(new_value, storage_engine)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            configuration_manager
+                .read()
+                .await
+                .optimize_target_file_size_in_bytes(),
+            new_value
+        );
+
+        let configuration_from_file = configuration_from_file(&temp_dir).await;
+        assert_eq!(
+            configuration_from_file.optimize_target_file_size_in_bytes,
+            new_value
+        );
+    }
+
+    #[tokio::test]
+    async fn test_set_optimize_target_file_size_in_bytes_rejects_zero() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (storage_engine, configuration_manager) = create_components(&temp_dir).await;
+
+        let result = configuration_manager
+            .write()
+            .await
+            .set_optimize_target_file_size_in_bytes(0, storage_engine)
+            .await;
+
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "Invalid Argument Error: Optimize target file size must be greater than zero."
+        );
+    }
+
+    #[tokio::test]
+    async fn test_set_vacuum_retention_period_in_seconds() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (storage_engine, configuration_manager) = create_components(&temp_dir).await;
+
+        assert_eq!(
+            configuration_manager
+                .read()
+                .await
+                .vacuum_retention_period_in_seconds(),
+            60 * 60 * 24 * 7
+        );
+
+        let new_value = 60;
+        configuration_manager
+            .write()
+            .await
+            .set_vacuum_retention_period_in_seconds(new_value, storage_engine)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            configuration_manager
+                .read()
+                .await
+                .vacuum_retention_period_in_seconds(),
+            new_value
+        );
+
+        let configuration_from_file = configuration_from_file(&temp_dir).await;
+        assert_eq!(
+            configuration_from_file.vacuum_retention_period_in_seconds,
+            new_value
+        );
+    }
+
+    #[tokio::test]
+    async fn test_set_vacuum_retention_period_in_seconds_rejects_too_large_value() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (storage_engine, configuration_manager) = create_components(&temp_dir).await;
+
+        let result = configuration_manager
+            .write()
+            .await
+            .set_vacuum_retention_period_in_seconds(
+                MAX_RETENTION_PERIOD_IN_SECONDS + 1,
+                storage_engine,
+            )
+            .await;
+
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            format!(
+                "Invalid Argument Error: Vacuum retention period cannot be more than {} seconds.",
+                MAX_RETENTION_PERIOD_IN_SECONDS
+            )
+        );
+    }
+
     /// Return the configuration from the configuration file at the root of `temp_dir`.
     async fn configuration_from_file(temp_dir: &TempDir) -> Configuration {
         let configuration_file_path = temp_dir.path().join(CONFIGURATION_FILE_NAME);
@@ -753,11 +1003,11 @@ mod tests {
         Arc<RwLock<ConfigurationManager>>,
     ) {
         let local_url = temp_dir.path().to_str().unwrap();
-        let local_data_folder = DataFolder::open_local_url(local_url).await.unwrap();
+        let local_data_folder = Arc::new(DataFolder::open_local_url(local_url).await.unwrap());
 
         let target_dir = tempfile::tempdir().unwrap();
         let target_url = target_dir.path().to_str().unwrap();
-        let remote_data_folder = DataFolder::open_local_url(target_url).await.unwrap();
+        let remote_data_folder = Arc::new(DataFolder::open_local_url(target_url).await.unwrap());
 
         let data_folders = DataFolders::new(
             local_data_folder.clone(),
@@ -773,7 +1023,7 @@ mod tests {
         let configuration_manager = Arc::new(RwLock::new(
             ConfigurationManager::try_new(
                 local_data_folder.clone(),
-                ClusterMode::MultiNode(Box::new(cluster)),
+                ClusterMode::MultiNode(cluster),
                 &default_args(),
             )
             .await

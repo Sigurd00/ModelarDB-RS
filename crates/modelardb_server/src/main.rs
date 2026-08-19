@@ -29,21 +29,13 @@ use clap::{Parser, Subcommand};
 use modelardb_types::types::CloudCredentials;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use crate::cluster::Cluster;
+use crate::cluster::ClusterMode;
 use crate::context::Context;
 use crate::data_folders::DataFolders;
 use crate::error::Result;
 
 #[global_allocator]
 static ALLOC: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
-
-/// The different possible modes that a ModelarDB server can be deployed in, assigned when the
-/// server is started.
-#[derive(Clone)]
-pub(crate) enum ClusterMode {
-    SingleNode,
-    MultiNode(Box<Cluster>),
-}
 
 /// Command line arguments for the ModelarDB server.
 #[derive(Parser)]
@@ -61,9 +53,9 @@ pub(crate) struct ServerArgs {
     #[arg(long, default_value_t = 9999, env = "MODELARDBD_PORT")]
     port: u16,
 
-    /// Amount of memory in bytes to reserve for storing multivariate time series.
-    #[arg(long, env = "MODELARDBD_MULTIVARIATE_RESERVED_MEMORY_IN_BYTES")]
-    multivariate_reserved_memory_in_bytes: Option<u64>,
+    /// Amount of memory in bytes to reserve for storing ingested time series.
+    #[arg(long, env = "MODELARDBD_INGESTED_RESERVED_MEMORY_IN_BYTES")]
+    ingested_reserved_memory_in_bytes: Option<u64>,
 
     /// Amount of memory in bytes to reserve for storing uncompressed data buffers.
     #[arg(long, env = "MODELARDBD_UNCOMPRESSED_RESERVED_MEMORY_IN_BYTES")]
@@ -83,6 +75,19 @@ pub(crate) struct ServerArgs {
     /// on-disk size to avoid the overhead of reading the file size after each write.
     #[arg(long, env = "MODELARDBD_SEGMENT_SIZE_THRESHOLD_IN_BYTES")]
     segment_size_threshold_in_bytes: Option<u64>,
+
+    /// Target size, in bytes, of the files produced when automatically compacting a table's
+    /// storage. This is also the default value used when an OPTIMIZE query is executed without an
+    /// explicit target size.
+    #[arg(long, env = "MODELARDBD_OPTIMIZE_TARGET_FILE_SIZE_IN_BYTES")]
+    optimize_target_file_size_in_bytes: Option<u64>,
+
+    /// Retention period, in seconds, used when automatically vacuuming a table during compaction.
+    /// This is also the default value used when a VACUUM query is executed without an explicit
+    /// retention period. Note that a very low value can delete files an in-progress query is still
+    /// scanning.
+    #[arg(long, env = "MODELARDBD_VACUUM_RETENTION_PERIOD_IN_SECONDS")]
+    vacuum_retention_period_in_seconds: Option<u64>,
 
     /// Whether the write-ahead log is enabled.
     #[arg(long, env = "MODELARDBD_WAL_ENABLED")]

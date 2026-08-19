@@ -29,6 +29,7 @@ use tracing::{debug, error, info};
 use crate::configuration::WalMode;
 use crate::error::Result;
 use crate::storage::compressed_data_buffer::{CompressedDataBuffer, CompressedSegmentBatch};
+use crate::storage::data_storage_compactor::DataStorageCompactor;
 use crate::storage::data_transfer::DataTransfer;
 use crate::storage::types::Message;
 use crate::storage::types::{Channels, MemoryPool};
@@ -36,10 +37,13 @@ use crate::storage::types::{Channels, MemoryPool};
 /// Stores data points compressed as segments containing metadata and models in memory to batch the
 /// compressed segments before saving them to Apache Parquet files.
 pub(super) struct CompressedDataManager {
+    /// Component that compacts a table by merging the small compressed files that accumulate for it
+    /// into fewer larger files and vacuuming the files left behind.
+    pub(super) data_storage_compactor: Arc<RwLock<DataStorageCompactor>>,
     /// Component that transfers saved compressed data to the remote data folder when it is necessary.
     pub(super) data_transfer: Arc<RwLock<Option<DataTransfer>>>,
     /// Folder containing all compressed data managed by the [`StorageEngine`](crate::storage::StorageEngine).
-    pub(crate) local_data_folder: DataFolder,
+    pub(crate) local_data_folder: Arc<DataFolder>,
     /// The compressed segments before they are saved to persistent storage. The key is the name of
     /// the time series table the compressed segments represents data points for so the Apache Parquet
     /// files can be partitioned by table.
@@ -57,13 +61,15 @@ pub(super) struct CompressedDataManager {
 
 impl CompressedDataManager {
     pub(super) fn new(
+        data_storage_compactor: Arc<RwLock<DataStorageCompactor>>,
         data_transfer: Arc<RwLock<Option<DataTransfer>>>,
-        local_data_folder: DataFolder,
+        local_data_folder: Arc<DataFolder>,
         channels: Arc<Channels>,
         memory_pool: Arc<MemoryPool>,
         wal_mode: WalMode,
     ) -> Self {
         Self {
+            data_storage_compactor,
             data_transfer,
             local_data_folder,
             compressed_data_buffers: DashMap::new(),
@@ -287,6 +293,14 @@ impl CompressedDataManager {
             self.memory_pool.remaining_compressed_memory_in_bytes()
         );
 
+        // Compact the compressed data for table_name on disk once enough new data has been written
+        // since the last compaction.
+        self.data_storage_compactor
+            .read()
+            .await
+            .increase_estimated_compactable_size(table_name, compressed_data_buffer_size_in_bytes)
+            .await?;
+
         Ok(())
     }
 
@@ -364,13 +378,15 @@ mod tests {
 
         assert!(data_manager.compressed_data_buffers.contains_key(key));
         assert_eq!(data_manager.compressed_queue.pop().unwrap(), key);
-        assert!(
+
+        // The batch contains two compressed segments, so the size of both is added to the buffer.
+        assert_eq!(
             data_manager
                 .compressed_data_buffers
                 .get(key)
                 .unwrap()
-                .size_in_bytes
-                > 0
+                .size_in_bytes,
+            2 * COMPRESSED_SEGMENTS_SIZE
         );
     }
 
@@ -394,13 +410,15 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(
+        // Each insert adds the size of the two compressed segments in the batch.
+        assert_eq!(previous_size, 2 * COMPRESSED_SEGMENTS_SIZE);
+        assert_eq!(
             data_manager
                 .compressed_data_buffers
                 .get(TIME_SERIES_TABLE_NAME)
                 .unwrap()
-                .size_in_bytes
-                > previous_size
+                .size_in_bytes,
+            4 * COMPRESSED_SEGMENTS_SIZE
         );
     }
 
@@ -485,10 +503,13 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(
-            -1 < data_manager
+        // The remaining memory was set to -1 above. Saving the buffer returns exactly the memory
+        // reserved for its two compressed segments.
+        assert_eq!(
+            data_manager
                 .memory_pool
-                .remaining_compressed_memory_in_bytes()
+                .remaining_compressed_memory_in_bytes(),
+            2 * COMPRESSED_SEGMENTS_SIZE as i64 - 1
         );
     }
 
@@ -528,11 +549,12 @@ mod tests {
             .await
             .unwrap();
 
+        // All the memory used for the buffer is returned when the buffer is saved.
         assert_eq!(
             data_manager
                 .memory_pool
                 .remaining_compressed_memory_in_bytes(),
-            1405
+            0
         );
 
         // There should no longer be any compressed data in memory.
@@ -566,7 +588,7 @@ mod tests {
 
         // Create a local data folder and save a single time series table to the Delta Lake.
         let temp_dir_url = temp_dir.path().to_str().unwrap();
-        let local_data_folder = DataFolder::open_local_url(temp_dir_url).await.unwrap();
+        let local_data_folder = Arc::new(DataFolder::open_local_url(temp_dir_url).await.unwrap());
 
         let time_series_table_metadata = table::time_series_table_metadata();
         local_data_folder
@@ -580,9 +602,18 @@ mod tests {
                 .unwrap(),
         ));
 
+        let compactor = DataStorageCompactor::try_new(
+            local_data_folder.clone(),
+            64 * 1024 * 1024,
+            60 * 60 * 24 * 7,
+        )
+        .await
+        .unwrap();
+
         (
             temp_dir,
             CompressedDataManager::new(
+                Arc::new(RwLock::new(compactor)),
                 Arc::new(RwLock::new(None)),
                 local_data_folder,
                 channels,

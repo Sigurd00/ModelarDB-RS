@@ -52,8 +52,8 @@ message TableMetadata {
 
 // Configuration of a ModelarDB node.
 message Configuration {
-  // Amount of memory to reserve for storing multivariate time series.
-  uint64 multivariate_reserved_memory_in_bytes = 1;
+  // Amount of memory to reserve for storing ingested time series.
+  uint64 ingested_reserved_memory_in_bytes = 1;
 
   // Amount of memory to reserve for storing uncompressed data buffers.
   uint64 uncompressed_reserved_memory_in_bytes = 2;
@@ -79,16 +79,27 @@ message Configuration {
 
   // Whether the write-ahead log is enabled.
   bool wal_enabled = 9;
+
+  // Target size, in bytes, of the files produced when automatically compacting a table's storage. This is also the
+  // default value used when an OPTIMIZE query is executed without an explicit target size.
+  uint64 optimize_target_file_size_in_bytes = 10;
+
+  // Retention period, in seconds, used when automatically vacuuming a table during compaction. This is also the
+  // default value used when a VACUUM query is executed without an explicit retention period. Note that a very low
+  // value can delete files an in-progress query is still scanning.
+  uint64 vacuum_retention_period_in_seconds = 11;
 }
 
 // Request to update the configuration of a ModelarDB node.
 message UpdateConfiguration {
   enum Setting {
-    MULTIVARIATE_RESERVED_MEMORY_IN_BYTES = 0;
+    INGESTED_RESERVED_MEMORY_IN_BYTES = 0;
     UNCOMPRESSED_RESERVED_MEMORY_IN_BYTES = 1;
     COMPRESSED_RESERVED_MEMORY_IN_BYTES = 2;
     TRANSFER_BATCH_SIZE_IN_BYTES = 3;
     SEGMENT_SIZE_THRESHOLD_IN_BYTES = 4;
+    OPTIMIZE_TARGET_FILE_SIZE_IN_BYTES = 5;
+    VACUUM_RETENTION_PERIOD_IN_SECONDS = 6;
   }
 
   // Setting to update in the configuration.
@@ -96,4 +107,57 @@ message UpdateConfiguration {
 
   // New value for the setting.
   optional uint64 new_value = 2;
+}
+
+// Metadata identifying a single node in a ModelarDB cluster.
+message NodeMetadata {
+  // Apache Arrow Flight URL that uniquely identifies the node.
+  string url = 1;
+
+  // Mode the node was started in, either "edge" or "cloud".
+  string mode = 2;
+}
+
+// The nodes that are currently part of a ModelarDB cluster.
+message ClusterNodes {
+  repeated NodeMetadata nodes = 1;
+}
+
+// Resource usage metrics for a single ModelarDB node.
+message NodeMetrics {
+  // Percentage of the CPU that is currently in use across all cores.
+  double cpu_usage_percentage = 1;
+
+  // Number of logical CPUs available to the node.
+  uint32 cpu_count = 2;
+
+  // Amount of memory currently in use on the node.
+  uint64 used_memory_in_bytes = 3;
+
+  // Total amount of memory on the node.
+  uint64 total_memory_in_bytes = 4;
+
+  // Amount of disk space currently in use on the disk holding the local data folder.
+  uint64 used_disk_space_in_bytes = 5;
+
+  // Total amount of disk space on the disk holding the local data folder.
+  uint64 total_disk_space_in_bytes = 6;
+
+  // Amount of memory currently in use for storing ingested time series.
+  uint64 ingested_used_memory_in_bytes = 7;
+
+  // Total amount of memory reserved for storing ingested time series.
+  uint64 ingested_reserved_memory_in_bytes = 8;
+
+  // Amount of memory currently in use for storing uncompressed data buffers.
+  uint64 uncompressed_used_memory_in_bytes = 9;
+
+  // Total amount of memory reserved for storing uncompressed data buffers.
+  uint64 uncompressed_reserved_memory_in_bytes = 10;
+
+  // Amount of memory currently in use for storing compressed data buffers.
+  uint64 compressed_used_memory_in_bytes = 11;
+
+  // Total amount of memory reserved for storing compressed data buffers.
+  uint64 compressed_reserved_memory_in_bytes = 12;
 }

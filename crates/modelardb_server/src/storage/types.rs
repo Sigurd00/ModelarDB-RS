@@ -98,7 +98,6 @@ impl MemoryPool {
     }
 
     /// Return the amount of memory available for ingested data in bytes.
-    #[cfg(test)]
     #[must_use]
     pub(super) fn remaining_ingested_memory_in_bytes(&self) -> i64 {
         *self
@@ -297,7 +296,7 @@ mod tests {
 
     // Tests for MemoryPool.
     #[test]
-    fn test_adjust_multivariate_memory_increase() {
+    fn test_adjust_ingested_memory_increase() {
         let memory_pool = create_memory_pool();
         assert_eq!(
             memory_pool.remaining_uncompressed_memory_in_bytes(),
@@ -313,7 +312,7 @@ mod tests {
     }
 
     #[test]
-    fn test_adjust_multivariate_memory_decrease_above_zero() {
+    fn test_adjust_ingested_memory_decrease_above_zero() {
         let memory_pool = create_memory_pool();
         assert_eq!(
             memory_pool.remaining_ingested_memory_in_bytes(),
@@ -329,7 +328,7 @@ mod tests {
     }
 
     #[test]
-    fn test_adjust_multivariate_memory_decrease_below_zero() {
+    fn test_adjust_ingested_memory_decrease_below_zero() {
         let memory_pool = create_memory_pool();
         assert_eq!(
             memory_pool.remaining_ingested_memory_in_bytes(),
@@ -345,7 +344,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reserve_available_multivariate_memory() {
+    fn test_reserve_available_ingested_memory() {
         let memory_pool = create_memory_pool();
         assert_eq!(
             memory_pool.remaining_ingested_memory_in_bytes(),

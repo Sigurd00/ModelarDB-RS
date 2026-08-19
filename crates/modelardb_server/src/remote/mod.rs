@@ -59,7 +59,7 @@ use tonic::transport::{Endpoint, Server};
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, error, info};
 
-use crate::ClusterMode;
+use crate::cluster::ClusterMode;
 use crate::context::Context;
 use crate::error::{ModelarDbServerError, Result};
 use crate::remote::auth_layer::AuthLayer;
@@ -67,7 +67,7 @@ use crate::remote::auth_layer::AuthLayer;
 /// Start an Apache Arrow Flight server on 0.0.0.0:`port` that passes `context` to the methods that
 /// process the requests through [`FlightServiceHandler`]. All requests are passed through the
 /// [`AuthLayer`], which authenticates them using `maybe_authenticator` before they are passed to
-/// the [`FlightServiceHandler`]. If `maybe_authenticator` is [`None`], authentication is disabled, 
+/// the [`FlightServiceHandler`]. If `maybe_authenticator` is [`None`], authentication is disabled,
 /// and every request that is not an internal cluster request is allowed.
 pub async fn start_apache_arrow_flight_server(
     context: Arc<Context>,
@@ -83,7 +83,7 @@ pub async fn start_apache_arrow_flight_server(
 
     let maybe_cluster_key = match context.configuration_manager.read().await.cluster_mode() {
         ClusterMode::MultiNode(cluster) => Some(cluster.key().clone()),
-        ClusterMode::SingleNode => None,
+        ClusterMode::SingleNode(_) => None,
     };
 
     let auth_layer = AuthLayer::new(maybe_authenticator, maybe_cluster_key);
@@ -471,9 +471,15 @@ impl FlightServiceHandler {
             }
         }
 
+        // If the retention period is not specified, use the local configuration retention period.
+        // The local retention period is not passed to the peer nodes above, so they can use their
+        // own local retention period.
+        let retention_period_in_seconds = maybe_retention_period_in_seconds
+            .unwrap_or(configuration_manager.vacuum_retention_period_in_seconds());
+
         for table_name in table_names {
             self.context
-                .vacuum_table(table_name, maybe_retention_period_in_seconds)
+                .vacuum_table(table_name, Some(retention_period_in_seconds))
                 .await
                 .map_err(error_to_status_invalid_argument)?;
         }
@@ -503,9 +509,15 @@ impl FlightServiceHandler {
             }
         }
 
+        // If the target size is not specified, use the local configuration target size. The local
+        // target size is not passed to the peer nodes above, so they can use their own local target
+        // size.
+        let target_size_in_bytes = maybe_target_size_in_bytes
+            .unwrap_or(configuration_manager.optimize_target_file_size_in_bytes());
+
         for table_name in table_names {
             self.context
-                .optimize_table(table_name, maybe_target_size_in_bytes)
+                .optimize_table(table_name, Some(target_size_in_bytes))
                 .await
                 .map_err(error_to_status_invalid_argument)?;
         }
@@ -874,10 +886,11 @@ impl FlightService for FlightServiceHandler {
     /// currently in memory to disk and then flushes all compressed data on disk to the remote
     /// object store. Note that data is only transferred to the remote object store if one was
     /// provided when starting the server.
-    /// * `KillNode`: An extension of the `FlushNode` action that first flushes all data to disk,
-    /// then flushes all compressed data to the remote object store, then removes the node
-    /// from the cluster if necessary, and finally kills the process that is running the server.
-    /// Note that since the process is killed, a conventional response cannot be returned.
+    /// * `KillNode`: An extension of the `FlushMemory` action that first flushes all data that is
+    /// currently in memory to disk, then removes the node from the cluster if necessary, and
+    /// finally kills the process that is running the server. Data is not transferred to the remote
+    /// object store. Use `FlushNode` first if that is required. Note that since the process is
+    /// killed, a conventional response cannot be returned.
     /// * `GetConfiguration`: Get the current server configuration. The value of each setting in the
     /// configuration is returned in a [`Configuration`](protocol::Configuration) protobuf message.
     /// * `UpdateConfiguration`: Update a single setting in the configuration. The setting to update
@@ -886,6 +899,12 @@ impl FlightService for FlightServiceHandler {
     /// and the change is persisted in the configuration file.
     /// * `NodeType`: Get the type of the node. The type is `SingleEdge`, `ClusterEdge`, or
     /// `ClusterCloud`. The type of the node is returned as a string.
+    /// * `ListNodes`: Get the nodes that are currently part of the cluster. The nodes are returned
+    /// in a [`ClusterNodes`](protocol::ClusterNodes) protobuf message. A single node returns only
+    /// itself.
+    /// * `NodeMetrics`: Get the current resource usage metrics of the node, including CPU, memory,
+    /// disk, and storage engine memory usage. The metrics are returned in a
+    /// [`NodeMetrics`](protocol::NodeMetrics) protobuf message.
     async fn do_action(
         &self,
         request: Request<Action>,
@@ -936,13 +955,11 @@ impl FlightService for FlightServiceHandler {
             // Confirm the data was flushed.
             Ok(Response::new(Box::pin(stream::empty())))
         } else if action.r#type == "KillNode" {
-            let mut storage_engine = self.context.storage_engine.write().await;
-            storage_engine
-                .flush()
+            self.context
+                .storage_engine
+                .write()
                 .await
-                .map_err(error_to_status_internal)?;
-            storage_engine
-                .transfer()
+                .flush()
                 .await
                 .map_err(error_to_status_internal)?;
 
@@ -983,11 +1000,11 @@ impl FlightService for FlightServiceHandler {
                 Status::invalid_argument(format!("New value for {setting} cannot be null."));
 
             match protocol::update_configuration::Setting::try_from(setting) {
-                Ok(protocol::update_configuration::Setting::MultivariateReservedMemoryInBytes) => {
+                Ok(protocol::update_configuration::Setting::IngestedReservedMemoryInBytes) => {
                     let new_value = maybe_new_value.ok_or(invalid_null_error)?;
 
                     configuration_manager
-                        .set_multivariate_reserved_memory_in_bytes(new_value, storage_engine)
+                        .set_ingested_reserved_memory_in_bytes(new_value, storage_engine)
                         .await
                         .map_err(error_to_status_internal)
                 }
@@ -1021,6 +1038,22 @@ impl FlightService for FlightServiceHandler {
                         .await
                         .map_err(error_to_status_internal)
                 }
+                Ok(protocol::update_configuration::Setting::OptimizeTargetFileSizeInBytes) => {
+                    let new_value = maybe_new_value.ok_or(invalid_null_error)?;
+
+                    configuration_manager
+                        .set_optimize_target_file_size_in_bytes(new_value, storage_engine)
+                        .await
+                        .map_err(error_to_status_internal)
+                }
+                Ok(protocol::update_configuration::Setting::VacuumRetentionPeriodInSeconds) => {
+                    let new_value = maybe_new_value.ok_or(invalid_null_error)?;
+
+                    configuration_manager
+                        .set_vacuum_retention_period_in_seconds(new_value, storage_engine)
+                        .await
+                        .map_err(error_to_status_internal)
+                }
                 _ => Err(Status::unimplemented(format!(
                     "{setting} is not an updatable setting in the server configuration."
                 ))),
@@ -1032,7 +1065,7 @@ impl FlightService for FlightServiceHandler {
             let configuration_manager = self.context.configuration_manager.read().await;
 
             let node_type = match configuration_manager.cluster_mode() {
-                ClusterMode::SingleNode => "SingleEdge",
+                ClusterMode::SingleNode(_) => "SingleEdge",
                 ClusterMode::MultiNode(cluster) => match cluster.node().mode {
                     ServerMode::Edge => "ClusterEdge",
                     ServerMode::Cloud => "ClusterCloud",
@@ -1045,6 +1078,29 @@ impl FlightService for FlightServiceHandler {
 
             Ok(Response::new(Box::pin(stream::once(async {
                 Ok(flight_result)
+            }))))
+        } else if action.r#type == "ListNodes" {
+            let configuration_manager = self.context.configuration_manager.read().await;
+            let nodes = configuration_manager
+                .cluster_mode()
+                .nodes()
+                .await
+                .map_err(error_to_status_internal)?;
+
+            let protobuf_bytes = modelardb_types::flight::encode_and_serialize_cluster_nodes(nodes);
+
+            Ok(Response::new(Box::pin(stream::once(async {
+                Ok(FlightResult {
+                    body: protobuf_bytes.into(),
+                })
+            }))))
+        } else if action.r#type == "NodeMetrics" {
+            let protobuf_bytes = self.context.node_metrics().await.encode_to_vec();
+
+            Ok(Response::new(Box::pin(stream::once(async {
+                Ok(FlightResult {
+                    body: protobuf_bytes.into(),
+                })
             }))))
         } else {
             Err(Status::unimplemented("Action not implemented."))
@@ -1078,8 +1134,9 @@ impl FlightService for FlightServiceHandler {
         let kill_node_action = ActionType {
             r#type: "KillNode".to_owned(),
             description: "Flush uncompressed data to disk by compressing and saving the data, \
-                          transfer all compressed data to the remote object store, and kill the \
-                          process running the server."
+                          remove the node from the cluster if necessary, and kill the process \
+                          running the server. Data is not transferred to the remote object store. \
+                          Use FlushNode first if that is required."
                 .to_owned(),
         };
 
@@ -1098,6 +1155,16 @@ impl FlightService for FlightServiceHandler {
             description: "Get the type of the node.".to_owned(),
         };
 
+        let list_nodes_action = ActionType {
+            r#type: "ListNodes".to_owned(),
+            description: "Get the nodes that are currently part of the cluster.".to_owned(),
+        };
+
+        let node_metrics_action = ActionType {
+            r#type: "NodeMetrics".to_owned(),
+            description: "Get the current resource usage metrics of the node.".to_owned(),
+        };
+
         let output = stream::iter(vec![
             Ok(create_tables_action),
             Ok(flush_memory_action),
@@ -1106,6 +1173,8 @@ impl FlightService for FlightServiceHandler {
             Ok(get_configuration_action),
             Ok(update_configuration_action),
             Ok(node_type_action),
+            Ok(list_nodes_action),
+            Ok(node_metrics_action),
         ]);
 
         Ok(Response::new(Box::pin(output)))
