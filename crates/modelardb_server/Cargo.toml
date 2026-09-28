@@ -14,10 +14,10 @@
 
 [package]
 name = "modelardb_server"
-version = "0.1.0"
-license = "Apache-2.0"
-edition = "2024"
-authors = ["Soeren Kejser Jensen <devel@kejserjensen.dk>"]
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+authors.workspace = true
 
 [[bin]]
 name = "modelardbd"
@@ -44,7 +44,6 @@ object_store = { workspace = true, features = ["aws", "azure"] }
 prost.workspace = true
 rand.workspace = true
 serde.workspace = true
-snmalloc-rs = { workspace = true, features = ["build_cc"] }
 sqlparser.workspace = true
 sysinfo.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }

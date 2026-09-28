@@ -23,37 +23,114 @@ pub mod parser;
 mod query;
 pub mod write_ahead_log;
 
-use std::result::Result as StdResult;
+use std::any::Any;
+use std::ops::Range;
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use arrow::compute;
 use arrow::compute::concat_batches;
+use arrow::datatypes::{DataType, Schema};
 use bytes::Bytes;
 use datafusion::catalog::{MemorySchemaProvider, TableProvider};
 use datafusion::datasource::sink::DataSink;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::execution::session_state::SessionStateBuilder;
-use datafusion::parquet::arrow::async_reader::{
-    AsyncFileReader, ParquetObjectReader, ParquetRecordBatchStream,
-};
-use datafusion::parquet::arrow::{AsyncArrowWriter, ParquetRecordBatchStreamBuilder};
-use datafusion::parquet::basic::{Compression, Encoding, ZstdLevel};
-use datafusion::parquet::errors::ParquetError;
-use datafusion::parquet::file::properties::{EnabledStatistics, WriterProperties};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion::sql::parser::Statement as DFStatement;
 use deltalake::DeltaTable;
-use deltalake::parquet::file::metadata::SortingColumn;
+use deltalake::parquet::arrow::arrow_reader::ArrowReaderOptions;
+use deltalake::parquet::arrow::async_reader::{AsyncFileReader, MetadataSuffixFetch};
+use deltalake::parquet::arrow::{AsyncArrowWriter, ParquetRecordBatchStreamBuilder};
+use deltalake::parquet::basic::{Compression, Encoding, ZstdLevel};
+use deltalake::parquet::errors::{ParquetError, Result as ParquetResult};
+use deltalake::parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader, SortingColumn};
+use deltalake::parquet::file::properties::{EnabledStatistics, WriterProperties};
+use deltalake::parquet::schema::types::ColumnPath;
 use futures::StreamExt;
+use futures::future::{BoxFuture, FutureExt, TryFutureExt};
+use modelardb_types::schemas::COMPRESSED_SCHEMA;
 use modelardb_types::types::TimeSeriesTableMetadata;
 use object_store::path::Path;
-use object_store::{ObjectStore, ObjectStoreExt};
+use object_store::{Error as ObjectStoreError, GetOptions, GetRange, ObjectStore, ObjectStoreExt};
 use sqlparser::ast::Statement;
 
 use crate::error::Result;
 use crate::query::normal_table::NormalTable;
 use crate::query::time_series_table::TimeSeriesTable;
+
+/// An [`AsyncFileReader`] for an Apache Parquet file in an [`ObjectStore`]. The implementation was
+/// based on the [`AsyncFileReader`] documentation, the `parquet/examples/object_store.rs` file in
+/// the Arrow-RS repository, and `ParquetObjectReader` which was provided by the `parquet` crate.
+struct ParquetObjectReader {
+    object_store: Arc<dyn ObjectStore>,
+    path: Path,
+}
+
+impl AsyncFileReader for ParquetObjectReader {
+    /// Retrieve the bytes in `range`.
+    fn get_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, ParquetResult<Bytes>> {
+        self.object_store
+            .get_range(&self.path, range)
+            .map_err(object_store_to_parquet_error)
+            .boxed()
+    }
+
+    /// Retrieve multiple byte ranges.
+    fn get_byte_ranges(
+        &mut self,
+        ranges: Vec<Range<u64>>,
+    ) -> BoxFuture<'_, ParquetResult<Vec<Bytes>>> {
+        async move {
+            self.object_store
+                .get_ranges(&self.path, &ranges)
+                .await
+                .map_err(object_store_to_parquet_error)
+        }
+        .boxed()
+    }
+
+    /// Retrieve the metadata from this Apache Parquet file.
+    fn get_metadata<'a>(
+        &'a mut self,
+        options: Option<&'a ArrowReaderOptions>,
+    ) -> BoxFuture<'a, ParquetResult<Arc<ParquetMetaData>>> {
+        async move {
+            let metadata = ParquetMetaDataReader::new()
+                .with_arrow_reader_options(options)
+                .load_via_suffix_and_finish(self)
+                .await?;
+            Ok(Arc::new(metadata))
+        }
+        .boxed()
+    }
+}
+
+impl MetadataSuffixFetch for &mut ParquetObjectReader {
+    /// Fetches the last `suffix` bytes without knowing the file size.
+    fn fetch_suffix(&mut self, suffix: usize) -> BoxFuture<'_, ParquetResult<Bytes>> {
+        let options = GetOptions {
+            range: Some(GetRange::Suffix(suffix as u64)),
+            ..Default::default()
+        };
+
+        async move {
+            self.object_store
+                .get_opts(&self.path, options)
+                .await
+                .map_err(object_store_to_parquet_error)?
+                .bytes()
+                .await
+                .map_err(object_store_to_parquet_error)
+        }
+        .boxed()
+    }
+}
+
+/// Convert [`ObjectStoreError`] to [`ParquetError`].
+fn object_store_to_parquet_error(error_store_error: ObjectStoreError) -> ParquetError {
+    ParquetError::External(Box::new(error_store_error))
+}
 
 /// The folder storing compressed table data in the data folders.
 const TABLE_FOLDER: &str = "tables";
@@ -131,8 +208,7 @@ pub fn register_time_series_table(
 pub fn maybe_table_provider_to_time_series_table_metadata(
     maybe_time_series_table: Arc<dyn TableProvider>,
 ) -> Option<Arc<TimeSeriesTableMetadata>> {
-    maybe_time_series_table
-        .as_any()
+    (maybe_time_series_table.as_ref() as &dyn Any)
         .downcast_ref::<TimeSeriesTable>()
         .map(|time_series_table| time_series_table.time_series_table_metadata())
 }
@@ -174,29 +250,12 @@ pub async fn read_record_batch_from_apache_parquet_file(
     file_path: &Path,
     object_store: Arc<dyn ObjectStore>,
 ) -> Result<RecordBatch> {
-    // Create an object reader for the Apache Parquet file.
-    let file_metadata = object_store
-        .head(file_path)
-        .await
-        .map_err(|error: object_store::Error| ParquetError::General(error.to_string()))?;
-
-    let reader = ParquetObjectReader::new(object_store, file_metadata.location);
+    let reader = ParquetObjectReader {
+        object_store,
+        path: file_path.clone(),
+    };
 
     // Stream the data from the Apache Parquet file into a single record batch.
-    let record_batches = read_batches_from_apache_parquet_file(reader).await?;
-
-    let schema = record_batches[0].schema();
-    compute::concat_batches(&schema, &record_batches).map_err(|error| error.into())
-}
-
-/// Read each batch of data from the Apache Parquet file given by `reader` and return them as a
-/// [`Vec`] of [`RecordBatch`]. If the file could not be read successfully,
-/// [`ModelarDbStorageError`](error::ModelarDbStorageError) is returned.
-pub async fn read_batches_from_apache_parquet_file<R>(reader: R) -> Result<Vec<RecordBatch>>
-where
-    R: AsyncFileReader + Send + Unpin + 'static,
-    ParquetRecordBatchStream<R>: StreamExt<Item = StdResult<RecordBatch, ParquetError>>,
-{
     let builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
     let mut stream = builder.build()?;
 
@@ -206,7 +265,8 @@ where
         record_batches.push(record_batch);
     }
 
-    Ok(record_batches)
+    let schema = record_batches[0].schema();
+    compute::concat_batches(&schema, &record_batches).map_err(|error| error.into())
 }
 
 /// Write the rows in `record_batch` to an Apache Parquet file at the location given by `file_path`
@@ -216,17 +276,17 @@ where
 pub async fn write_record_batch_to_apache_parquet_file(
     file_path: &Path,
     record_batch: &RecordBatch,
-    sorting_columns: Option<Vec<SortingColumn>>,
     object_store: &dyn ObjectStore,
 ) -> Result<()> {
     // Check if the extension of the given path is correct.
     if file_path.extension() == Some("parquet") {
-        let props = apache_parquet_writer_properties(sorting_columns);
+        let schema = record_batch.schema_ref();
+        let writer_properties = writer_properties_for_metadata_and_normal_tables(schema)?;
 
         // Write the record batch to the object store.
         let mut buffer = Vec::new();
         let mut writer =
-            AsyncArrowWriter::try_new(&mut buffer, record_batch.schema(), Some(props))?;
+            AsyncArrowWriter::try_new(&mut buffer, record_batch.schema(), Some(writer_properties))?;
         writer.write(record_batch).await?;
         writer.close().await?;
 
@@ -244,11 +304,61 @@ pub async fn write_record_batch_to_apache_parquet_file(
     }
 }
 
-/// Return [`WriterProperties`] optimized for compressed segments for Apache Parquet and Delta Lake.
-fn apache_parquet_writer_properties(
-    sorting_columns: Option<Vec<SortingColumn>>,
-) -> WriterProperties {
-    WriterProperties::builder()
+/// Return [`WriterProperties`] optimized for storing relational data in Apache Parquet files
+/// managed by Delta Lake.
+fn writer_properties_for_metadata_and_normal_tables(schema: &Schema) -> Result<WriterProperties> {
+    // Create WriterProperties with values that generally perform better than the defaults.
+    let mut writer_properties = WriterProperties::builder()
+        .set_compression(Compression::ZSTD(ZstdLevel::default()))
+        .set_dictionary_enabled(false)
+        .set_statistics_enabled(EnabledStatistics::None)
+        .set_bloom_filter_enabled(false);
+
+    // Specify encodings for data type where specific encodings generally are known to perform well.
+    for field in schema.fields() {
+        let maybe_encoding = match field.data_type() {
+            DataType::Timestamp(_, _) => Some(Encoding::DELTA_BINARY_PACKED),
+            DataType::Float16 | DataType::Float32 | DataType::Float64 => {
+                Some(Encoding::BYTE_STREAM_SPLIT)
+            }
+            _ => None,
+        };
+
+        if let Some(encoding) = maybe_encoding {
+            let path = ColumnPath::from(field.name().as_str());
+            writer_properties = writer_properties.set_column_encoding(path, encoding);
+        }
+    }
+
+    Ok(writer_properties.build())
+}
+
+/// Return [`WriterProperties`] optimized for storing compressed segments in Apache Parquet files
+/// managed by Delta Lake.
+fn writer_properties_for_time_series_table(schema: &Schema) -> Result<WriterProperties> {
+    // Specify that the file must be sorted by the tag columns and then by start_time.
+    let base_compressed_schema_len = COMPRESSED_SCHEMA.0.fields().len();
+    let compressed_schema_len = schema.fields().len();
+    let sorting_columns_len = (compressed_schema_len - base_compressed_schema_len) + 1;
+    let mut sorting_columns = Vec::with_capacity(sorting_columns_len);
+
+    // Compressed segments have the tag columns at the end of the schema.
+    for tag_column_index in base_compressed_schema_len..compressed_schema_len {
+        sorting_columns.push(SortingColumn {
+            column_idx: tag_column_index as i32,
+            descending: false,
+            nulls_first: false,
+        });
+    }
+
+    // Compressed segments store the first timestamp in the second column.
+    sorting_columns.push(SortingColumn {
+        column_idx: 1,
+        descending: false,
+        nulls_first: false,
+    });
+
+    Ok(WriterProperties::builder()
         .set_data_page_size_limit(16384)
         .set_max_row_group_row_count(Some(65536))
         .set_encoding(Encoding::PLAIN)
@@ -256,8 +366,8 @@ fn apache_parquet_writer_properties(
         .set_dictionary_enabled(false)
         .set_statistics_enabled(EnabledStatistics::None)
         .set_bloom_filter_enabled(false)
-        .set_sorting_columns(sorting_columns)
-        .build()
+        .set_sorting_columns(Some(sorting_columns))
+        .build())
 }
 
 #[cfg(test)]
@@ -315,9 +425,9 @@ mod tests {
         let result = read_record_batch_from_apache_parquet_file(&path, object_store).await;
 
         // The specific error message is OS-dependent, so we only check that it contains the
-        // expected prefix and OS error code.
+        // expected prefix and that it contains the OS error code somewhere in the string.
         let actual_error_message = result.unwrap_err().to_string();
-        assert!(actual_error_message.contains("Parquet error: Object at location"));
+        assert!(actual_error_message.starts_with("Parquet Error: External: Object at location"));
         assert!(actual_error_message.contains("os error 2"));
     }
 
@@ -381,8 +491,7 @@ mod tests {
         let object_store = LocalFileSystem::new_with_prefix(temp_dir.path()).unwrap();
 
         let result =
-            write_record_batch_to_apache_parquet_file(file_path, record_batch, None, &object_store)
-                .await;
+            write_record_batch_to_apache_parquet_file(file_path, record_batch, &object_store).await;
 
         (temp_dir, result)
     }

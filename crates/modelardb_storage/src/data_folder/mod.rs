@@ -48,7 +48,6 @@ use modelardb_types::types::{
     ArrowValue, CloudCredentials, ErrorBound, GeneratedColumn, MAX_RETENTION_PERIOD_IN_SECONDS,
     TimeSeriesTableMetadata,
 };
-use object_store::aws::AmazonS3Builder;
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
 use object_store::path::Path;
@@ -58,7 +57,10 @@ use url::Url;
 use crate::data_folder::delta_table_writer::DeltaTableWriter;
 use crate::error::{ModelarDbStorageError, Result};
 use crate::query::normal_table::NormalTable;
-use crate::{METADATA_FOLDER, TABLE_FOLDER, sql_and_concat};
+use crate::{
+    METADATA_FOLDER, TABLE_FOLDER, sql_and_concat,
+    writer_properties_for_metadata_and_normal_tables, writer_properties_for_time_series_table,
+};
 
 /// Types of tables supported by ModelarDB.
 enum TableType {
@@ -194,31 +196,18 @@ impl DataFolder {
     ) -> Result<Self> {
         let location = format!("s3://{bucket_name}");
 
-        // TODO: Determine if it is safe to use AWS_S3_ALLOW_UNSAFE_RENAME.
         let storage_options = HashMap::from([
             ("aws_access_key_id".to_owned(), access_key_id),
             ("aws_secret_access_key".to_owned(), secret_access_key),
             ("aws_endpoint_url".to_owned(), endpoint),
             ("aws_bucket_name".to_owned(), bucket_name),
-            ("aws_s3_allow_unsafe_rename".to_owned(), "true".to_owned()),
+            ("aws_allow_http".to_owned(), "true".to_owned()),
         ]);
 
         let url = Url::parse(&location)
             .map_err(|error| ModelarDbStorageError::InvalidArgument(error.to_string()))?;
 
-        // Build the Amazon S3 object store with the given storage options manually to allow http.
-        let object_store = storage_options
-            .iter()
-            .fold(
-                AmazonS3Builder::new()
-                    .with_url(url.to_string())
-                    .with_allow_http(true),
-                |builder, (key, value)| {
-                    let key = key.parse().unwrap();
-                    builder.with_config(key, value)
-                },
-            )
-            .build()?;
+        let (object_store, _path) = object_store::parse_url_opts(&url, &storage_options)?;
 
         Self::try_new(location, storage_options, Arc::new(object_store)).await
     }
@@ -242,8 +231,10 @@ impl DataFolder {
             ("azure_container_name".to_owned(), container_name),
             ("azure_storage_use_emulator".to_owned(), use_emulator),
         ]);
+
         let url = Url::parse(&location)
             .map_err(|error| ModelarDbStorageError::InvalidArgument(error.to_string()))?;
+
         let (object_store, _path) = object_store::parse_url_opts(&url, &storage_options)?;
 
         Self::try_new(location, storage_options, Arc::new(object_store)).await
@@ -588,7 +579,11 @@ impl DataFolder {
         self.delete_table_metadata(table_name).await?;
 
         let table_path = format!("{TABLE_FOLDER}/{table_name}");
-        self.delete_table_files(&table_path).await
+        let deleted_paths = self.delete_table_files(&table_path).await?;
+
+        self.remove_delta_table_from_cache(table_name);
+
+        Ok(deleted_paths)
     }
 
     /// Depending on the type of the table with `table_name`, delete either the normal table metadata
@@ -634,17 +629,18 @@ impl DataFolder {
             .map_ok(|object_meta| object_meta.location)
             .boxed();
 
-        let deleted_paths = self
-            .object_store
+        self.object_store
             .delete_stream(file_locations)
             .try_collect::<Vec<Path>>()
-            .await?;
+            .await
+            .map_err(|error| error.into())
+    }
 
-        // Remove the table from the cache.
-        let delta_table_path = format!("{}/{}", self.location, table_path);
-        self.delta_table_cache.remove(&delta_table_path);
-
-        Ok(deleted_paths)
+    /// Remove the [`DeltaTable`] for the table with `table_name` from the cache so the table is
+    /// opened from the Delta Lake again the next time it is used.
+    pub fn remove_delta_table_from_cache(&self, table_name: &str) {
+        self.delta_table_cache
+            .remove(&self.location_of_table(table_name));
     }
 
     /// Truncate the Delta Lake table with `table_name` by deleting all rows in the table. If the
@@ -707,7 +703,18 @@ impl DataFolder {
             )
         })?;
 
-        delta_table.optimize().with_target_size(target_size).await?;
+        let schema = delta_table.snapshot()?.snapshot().arrow_schema();
+        let writer_properties = if is_time_series_delta_table(&delta_table)? {
+            writer_properties_for_time_series_table(&schema)?
+        } else {
+            writer_properties_for_metadata_and_normal_tables(&schema)?
+        };
+
+        delta_table
+            .optimize()
+            .with_writer_properties(writer_properties)
+            .with_target_size(target_size)
+            .await?;
 
         Ok(())
     }
@@ -1789,7 +1796,11 @@ mod tests {
         let schema = test_table::time_series_table_metadata()
             .compressed_schema
             .clone();
-        let column_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        let column_names: Vec<String> = schema
+            .fields()
+            .iter()
+            .map(|field| format!("\"{}\"", field.name()))
+            .collect();
 
         let table_provider = delta_table.table_provider().build().await.unwrap();
         data_folder
