@@ -32,6 +32,7 @@ use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::physical_plan::{FileGroup, FileScanConfigBuilder, ParquetSource};
 use datafusion::datasource::provider::TableProviderFilterPushDown;
 use datafusion::datasource::sink::{DataSink, DataSinkExec};
+use datafusion::datasource::source::DataSource;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::context::ExecutionProps;
@@ -42,7 +43,7 @@ use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::{
     LexOrdering, LexRequirement, PhysicalSortExpr, PhysicalSortRequirement, planner,
 };
-use datafusion::physical_plan::{ExecutionPlan, PhysicalExpr};
+use datafusion::physical_plan::{ExecutionPlan, Partitioning, PhysicalExpr};
 use deltalake::kernel::LogicalFileView;
 use deltalake::{DeltaTable, FilterLiteral, FilterOp, FilterValue, ObjectMeta};
 use futures::TryStreamExt;
@@ -69,10 +70,8 @@ pub(crate) struct TimeSeriesTable {
     fallback_field_column: u16,
     /// Schema of the compressed segments stored on disk.
     query_compressed_schema: Arc<Schema>,
-    /// The sort order [`DataSourceExec`] guarantees for the segments it produces. It is guaranteed
-    /// by [`DataSourceExec`] because the storage engine uses this sort order for each Apache
-    /// Parquet file in this time series table and these files are read sequentially by
-    /// [`DataSourceExec`].
+    /// The segment ordering declared to Apache DataFusion. Apache DataFusion validates that this
+    /// ordering holds across the files in a file group and adds sorting if it cannot prove it.
     query_order_segment: LexOrdering,
     /// The sort order that [`GridExec`] requires for the segments it receives as its input.
     query_requirement_segment: LexRequirement,
@@ -447,12 +446,21 @@ async fn new_data_source_exec(
         Arc::new(ParquetSource::new(file_schema))
     };
 
-    let file_scan_config = FileScanConfigBuilder::new(log_store.object_store_url(), file_source)
-        .with_file_group(file_group)
-        .with_limit(maybe_limit)
-        .with_output_ordering(output_ordering);
+    let mut file_scan_config =
+        FileScanConfigBuilder::new(log_store.object_store_url(), file_source)
+            .with_file_group(file_group)
+            .with_limit(maybe_limit)
+            .with_output_ordering(output_ordering)
+            .build();
 
-    Ok(DataSourceExec::from_data_source(file_scan_config.build()))
+    // GridExec requires a single ordered input. If Apache DataFusion validates the scan's
+    // ordering, preserve its single partition instead of splitting it and adding sorting and
+    // merging to restore that requirement. Scans that still need sorting can be read in parallel.
+    if file_scan_config.eq_properties().output_ordering().is_some() {
+        file_scan_config.output_partitioning = Some(Partitioning::UnknownPartitioning(1));
+    }
+
+    Ok(DataSourceExec::from_data_source(file_scan_config))
 }
 
 /// Convert the [`LogicalFileView`] `logical_file_view` to a [`PartitionedFile`]. A
@@ -704,12 +712,206 @@ impl TableProvider for TimeSeriesTable {
 mod tests {
     use super::*;
 
+    use std::any::Any;
+
+    use arrow::array::{RecordBatch, StringViewArray};
+    use arrow::compute::concat_batches;
+    use datafusion::execution::session_state::SessionStateBuilder;
     use datafusion::logical_expr::lit;
-    use datafusion::prelude::Expr;
-    use modelardb_test::table;
-    use modelardb_types::types::Timestamp;
+    use datafusion::physical_plan::sorts::sort::SortExec;
+    use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
+    use datafusion::physical_plan::{ExecutionPlanProperties, collect, displayable};
+    use datafusion::prelude::{Expr, SessionConfig, SessionContext};
+    use modelardb_compression::try_compress_multivariate_time_series;
+    use modelardb_test::table::{self, NoOpDataSink, TIME_SERIES_TABLE_NAME};
+    use modelardb_types::types::{ErrorBound, Timestamp, TimestampArray, ValueArray};
+
+    use crate::data_folder::DataFolder;
 
     const TIMESTAMP_PREDICATE_VALUE: Timestamp = 37;
+
+    // Tests for the ordering of scans over stored segments.
+    #[tokio::test]
+    async fn test_scan_one_sorted_file_without_sorting() {
+        assert_stored_time_series_scan(&[&[(1, "a"), (2, "a"), (1, "b"), (2, "b")]], true).await;
+    }
+
+    #[tokio::test]
+    async fn test_scan_multiple_files_preserves_required_sorting() {
+        assert_stored_time_series_scan(&[&[(1, "a"), (2, "a")], &[(3, "a"), (4, "a")]], false)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_scan_interleaved_files_preserves_required_sorting() {
+        assert_stored_time_series_scan(&[&[(1, "a"), (1, "b")], &[(2, "a"), (2, "b")]], false)
+            .await;
+    }
+
+    /// Check the plan and reconstructed values using Apache DataFusion's standard optimizer.
+    async fn assert_stored_time_series_scan(
+        file_rows: &[&[(Timestamp, &str)]],
+        expect_ordered_scan: bool,
+    ) {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let data_folder = DataFolder::open_local(temp_dir.path()).await.unwrap();
+        let mut metadata = table::time_series_table_metadata();
+        metadata.error_bounds.fill(ErrorBound::Lossless);
+        let metadata = Arc::new(metadata);
+        let mut delta_table = data_folder
+            .create_time_series_table(&metadata)
+            .await
+            .unwrap();
+
+        for rows in file_rows {
+            let record_batch = time_series_record_batch(rows, metadata.schema.clone());
+            let compressed_segments =
+                try_compress_multivariate_time_series(&metadata, &record_batch).unwrap();
+            delta_table = data_folder
+                .write_record_batches(TIME_SERIES_TABLE_NAME, compressed_segments)
+                .await
+                .unwrap();
+        }
+
+        // Each write creates one file per field column. Make even these small files eligible for
+        // scan repartitioning, so the test also catches sorting introduced by that optimization.
+        assert_eq!(
+            delta_table.get_file_uris().unwrap().count(),
+            file_rows.len() * metadata.field_column_indices.len()
+        );
+        let mut session_config = SessionConfig::new().with_target_partitions(2);
+        session_config
+            .options_mut()
+            .optimizer
+            .repartition_file_min_size = 0;
+        let session_context = SessionContext::new_with_config(session_config);
+        session_context
+            .register_table(
+                TIME_SERIES_TABLE_NAME,
+                TimeSeriesTable::new(delta_table, metadata.clone(), Arc::new(NoOpDataSink {})),
+            )
+            .unwrap();
+
+        let physical_plan = session_context
+            .sql(&format!(
+                "SELECT timestamp, field_1, field_2, tag FROM {TIME_SERIES_TABLE_NAME}"
+            ))
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let plan_text = displayable(physical_plan.as_ref()).indent(true).to_string();
+
+        let mut operators = vec![physical_plan.clone()];
+        let mut grid_count = 0;
+        let mut sort_count = 0;
+        while let Some(operator) = operators.pop() {
+            let operator_any = operator.as_ref() as &dyn Any;
+            if operator_any.is::<GridExec>() {
+                grid_count += 1;
+                if expect_ordered_scan {
+                    assert!(
+                        (operator.children()[0].as_ref() as &dyn Any).is::<DataSourceExec>(),
+                        "{plan_text}"
+                    );
+                }
+            }
+            if operator_any.is::<SortExec>() || operator_any.is::<SortPreservingMergeExec>() {
+                sort_count += 1;
+            }
+            if operator_any.is::<DataSourceExec>() {
+                let expected_partitions = if expect_ordered_scan { 1 } else { 2 };
+                assert_eq!(
+                    operator.output_partitioning().partition_count(),
+                    expected_partitions,
+                    "{plan_text}"
+                );
+            }
+            operators.extend(operator.children().into_iter().cloned());
+        }
+        assert_eq!(grid_count, metadata.field_column_indices.len());
+        assert_eq!(sort_count == 0, expect_ordered_scan, "{plan_text}");
+
+        let record_batches = collect(physical_plan, session_context.task_ctx())
+            .await
+            .unwrap();
+        let actual = concat_batches(&metadata.schema, &record_batches).unwrap();
+        let mut expected_rows: Vec<_> = file_rows
+            .iter()
+            .flat_map(|rows| rows.iter().copied())
+            .collect();
+        expected_rows.sort_by_key(|(timestamp, tag)| (*tag, *timestamp));
+        let expected = time_series_record_batch(&expected_rows, metadata.schema.clone());
+        assert_eq!(actual, expected);
+
+        if expect_ordered_scan {
+            assert_aggregates_use_models(&session_context).await;
+        }
+    }
+
+    /// Check that preserving the scan's partition lets the existing aggregate optimizer rewrite
+    /// the plan, and that the rewritten aggregates return the same results as reconstruction.
+    async fn assert_aggregates_use_models(session_context: &SessionContext) {
+        let mut state_builder = SessionStateBuilder::new_from_existing(session_context.state());
+        for rule in crate::optimizer::physical_optimizer_rules() {
+            state_builder = state_builder.with_physical_optimizer_rule(rule);
+        }
+        let optimized_context = SessionContext::new_with_state(state_builder.build());
+
+        for aggregates in [
+            "COUNT(field_1), MIN(field_1), MAX(field_1), SUM(field_1)",
+            "AVG(field_1)",
+            "SUM(field_1) + 1",
+        ] {
+            let query = format!("SELECT {aggregates} FROM {TIME_SERIES_TABLE_NAME}");
+            let expected = session_context
+                .sql(&query)
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            let physical_plan = optimized_context
+                .sql(&query)
+                .await
+                .unwrap()
+                .create_physical_plan()
+                .await
+                .unwrap();
+            let plan_text = displayable(physical_plan.as_ref()).indent(true).to_string();
+            assert!(plan_text.contains("model_"), "{plan_text}");
+            assert!(!plan_text.contains("GridExec"), "{plan_text}");
+
+            let actual = collect(physical_plan, optimized_context.task_ctx())
+                .await
+                .unwrap();
+            assert_eq!(actual, expected);
+        }
+    }
+
+    /// Give the two fields distinct values for every timestamp and tag to check reconstruction.
+    fn time_series_record_batch(rows: &[(Timestamp, &str)], schema: Arc<Schema>) -> RecordBatch {
+        let timestamps =
+            TimestampArray::from_iter_values(rows.iter().map(|(timestamp, _)| *timestamp));
+        let values: Vec<_> = rows
+            .iter()
+            .map(|(timestamp, tag)| *timestamp as f32 + tag.as_bytes()[0] as f32)
+            .collect();
+        let field_1 = ValueArray::from(values.clone());
+        let field_2 = ValueArray::from_iter_values(values.into_iter().map(|value| value * 2.0));
+        let tags = StringViewArray::from_iter_values(rows.iter().map(|(_, tag)| *tag));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(timestamps),
+                Arc::new(field_1),
+                Arc::new(field_2),
+                Arc::new(tags),
+            ],
+        )
+        .unwrap()
+    }
 
     // Tests for rewrite_and_combine_filters().
     #[test]
